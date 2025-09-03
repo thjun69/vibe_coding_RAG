@@ -20,12 +20,13 @@ if settings.USE_MOCK_MODE:
     from mock_engine import MockDocumentProcessor, MockRAGQueryEngine
     document_processor = MockDocumentProcessor()
     rag_engine = MockRAGQueryEngine(document_processor)
-    logging.info("Running in MOCK MODE - OpenAI API not required")
+    logging.info("Running in MOCK MODE - Upstage AI API not required")
 else:
     from document_processor import DocumentProcessor
     from rag_engine import RAGQueryEngine
     document_processor = DocumentProcessor()
     rag_engine = RAGQueryEngine(document_processor)
+    logging.info("Running in NORMAL MODE - Upstage AI API required")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

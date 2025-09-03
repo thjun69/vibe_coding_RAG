@@ -1,26 +1,36 @@
-# ResearchBot - AI 논문 분석 챗봇
+# ResearchBot - AI 논문 분석 챗봇 MVP
 
-기업 R&D 엔지니어를 위한 AI 논문 분석 챗봇 MVP입니다. PDF 논문을 업로드하여 AI와 대화형으로 분석할 수 있습니다.
+## 📋 프로젝트 개요
 
-## 주요 기능
+**ResearchBot**은 논문 PDF를 업로드하고 AI와 대화하며 논문 내용을 분석할 수 있는 RAG(Retrieval-Augmented Generation) 기반 챗봇입니다.
 
-- 📄 PDF 논문 드래그 앤 드롭 업로드
-- 🤖 AI 챗봇과 논문 내용 질문-답변
-- 📍 정확한 출처 정보 제공 (페이지, 섹션)
-- 💬 대화 히스토리 저장
-- 📱 반응형 웹 인터페이스
+## 🚀 주요 기능
 
-## 기술 스택
+- **📄 PDF 업로드**: 논문 PDF 파일을 드래그 앤 드롭으로 업로드
+- **🤖 AI 대화**: 업로드된 논문에 대해 질문하고 AI 답변 받기
+- **🔍 출처 제공**: 답변의 출처 정보(페이지, 섹션) 자동 제공
+- **📚 기존 파일 관리**: 업로드 폴더의 기존 PDF 파일 목록 표시
+- **💡 샘플 질문**: 논문 분석을 위한 유용한 샘플 질문 제공
 
-- **Frontend**: React 18 + TypeScript + Tailwind CSS
-- **Backend**: FastAPI + Python 3.11
-- **Vector DB**: ChromaDB
-- **LLM**: OpenAI GPT-3.5-turbo
-- **Embedding**: OpenAI text-embedding-ada-002
+## 🏗️ 기술 스택
 
-## 빠른 시작
+### Backend
+- **FastAPI**: Python 웹 프레임워크
+- **Upstage AI**: 한국의 AI 서비스 (Solar 모델)
+- **ChromaDB**: 벡터 데이터베이스
+- **PyPDF2**: PDF 텍스트 추출
+- **LangChain**: LLM 애플리케이션 프레임워크
 
-### 1. 저장소 클론
+### Frontend
+- **React 18**: 사용자 인터페이스
+- **TypeScript**: 타입 안전성
+- **Tailwind CSS**: 스타일링
+- **shadcn/ui**: UI 컴포넌트
+- **React Query**: 데이터 페칭 및 상태 관리
+
+## 🛠️ 설치 및 실행
+
+### 1. 프로젝트 클론
 ```bash
 git clone <repository-url>
 cd vibe_coding_RAG
@@ -30,35 +40,137 @@ cd vibe_coding_RAG
 ```bash
 cd backend
 pip install -r requirements.txt
-cp .env.example .env
-# .env 파일에 OPENAI_API_KEY 설정
-uvicorn main:app --reload
+cp env.example .env
+# .env 파일에서 Upstage AI API 키 설정
 ```
 
 ### 3. Frontend 설정
 ```bash
 cd frontend
 npm install
+```
+
+### 4. 서버 실행
+```bash
+# Backend (새 터미널)
+cd backend
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
+
+# Frontend (새 터미널)
+cd frontend
 npm run dev
 ```
 
-### 4. 브라우저에서 접속
-- Frontend: http://localhost:3000
-- Backend API: http://localhost:8000
+## ⚙️ 환경 변수 설정
 
-## 사용법
+### Backend (.env)
+```env
+# Upstage AI API 설정
+UPSTAGE_API_KEY=your_upstage_api_key_here
+UPSTAGE_BASE_URL=https://api.upstage.ai
 
-1. 웹사이트에 접속
-2. PDF 논문 파일을 드래그 앤 드롭으로 업로드
-3. 문서 처리 완료 대기 (약 30초)
-4. 논문에 대한 질문 입력
-5. AI 답변과 출처 정보 확인
+# CORS 설정
+CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
 
-## 개발 일정
+# 파일 업로드 설정
+MAX_FILE_SIZE=52428800
+UPLOAD_DIR=./uploads
+CHROMADB_PERSIST_DIRECTORY=./chroma_db
 
-- **Day 1**: Backend API 및 PDF 처리 파이프라인
-- **Day 2**: Frontend UI 및 통합 테스트
+# API 설정
+API_PREFIX=/api
+DEBUG=true
 
-## 라이선스
+# LLM 모델 설정
+LLM_MODEL=solar-1-mini
+EMBEDDING_MODEL=solar-embedding-1-mini
+
+# Mock 모드 설정 (Upstage AI API 할당량 부족 시 true로 설정)
+USE_MOCK_MODE=false
+```
+
+## 🔧 Mock 모드
+
+API 할당량이 부족하거나 테스트 목적으로 Mock 모드를 사용할 수 있습니다:
+
+```env
+USE_MOCK_MODE=true
+```
+
+Mock 모드에서는:
+- 실제 Upstage AI API 호출 없이 테스트 가능
+- 가상의 논문 분석 응답 제공
+- 기존 PDF 파일과의 대화 지원
+
+## 📱 사용법
+
+### 1. 홈페이지 접속
+- `http://localhost:3000` 접속
+- 기존 PDF 파일 목록 확인
+
+### 2. PDF 업로드
+- "PDF 업로드" 메뉴 클릭
+- PDF 파일을 드래그 앤 드롭
+- 처리 완료까지 대기
+
+### 3. AI와 대화
+- "채팅 시작" 클릭
+- 논문 내용에 대해 질문
+- AI 답변과 출처 정보 확인
+
+### 4. 샘플 질문 활용
+- 제공되는 샘플 질문 클릭
+- 논문 분석을 위한 가이드 활용
+
+## 🏛️ 시스템 아키텍처
+
+```
+Frontend (React) ←→ Backend (FastAPI) ←→ Upstage AI API
+                           ↓
+                    ChromaDB (Vector DB)
+                           ↓
+                    PDF Processing Pipeline
+```
+
+## 🔍 API 엔드포인트
+
+- `GET /api/documents/existing`: 기존 PDF 파일 목록
+- `POST /api/documents/upload`: PDF 업로드
+- `GET /api/documents/{id}/status`: 처리 상태 확인
+- `POST /api/chat/{id}`: 채팅 메시지 전송
+- `GET /api/chat/{session_id}/history`: 채팅 히스토리
+- `GET /api/chat/{id}/sample-questions`: 샘플 질문
+- `DELETE /api/documents/{id}`: 문서 삭제
+
+## 🎯 개발 일정
+
+- **Day 1**: 프로젝트 설정, Backend API 개발
+- **Day 2**: Frontend UI 개발, 통합 테스트
+
+## 🚧 제한사항 (MVP)
+
+- 단일 사용자 환경
+- 인메모리 세션 관리
+- 기본적인 PDF 텍스트 추출
+- 제한된 파일 크기 (50MB)
+
+## 🔮 향후 개선 계획
+
+- 사용자 계정 및 인증 시스템
+- 대화 히스토리 영구 저장
+- 다국어 지원 확대
+- 모바일 최적화
+- 고급 PDF 처리 (수식, 도표)
+- 협업 기능
+
+## 📄 라이선스
 
 MIT License
+
+## 👥 기여
+
+이슈 리포트 및 풀 리퀘스트 환영합니다!
+
+---
+
+**ResearchBot**으로 논문 분석을 더욱 쉽고 효율적으로 만들어보세요! 🚀

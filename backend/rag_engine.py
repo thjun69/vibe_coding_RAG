@@ -1,7 +1,7 @@
 import time
 import logging
 from typing import List, Dict, Any
-from langchain_openai import ChatOpenAI
+from langchain_upstage import ChatUpstage
 from langchain.schema import HumanMessage, SystemMessage
 
 from config import settings
@@ -13,11 +13,11 @@ logger = logging.getLogger(__name__)
 class RAGQueryEngine:
     def __init__(self, document_processor: DocumentProcessor):
         self.document_processor = document_processor
-        self.llm = ChatOpenAI(
-            model=settings.LLM_MODEL,
-            openai_api_key=settings.OPENAI_API_KEY,
-            temperature=0.1,
-            max_tokens=1000
+        
+        # Upstage AI 설정
+        self.chat = ChatUpstage(
+            api_key=settings.UPSTAGE_API_KEY,
+            model=settings.LLM_MODEL
         )
         
         # 시스템 프롬프트
@@ -119,7 +119,7 @@ class RAGQueryEngine:
 """)
             ]
             
-            response = await self.llm.ainvoke(messages)
+            response = await self.chat.ainvoke(messages)
             return response.content
             
         except Exception as e:
