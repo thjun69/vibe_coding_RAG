@@ -15,6 +15,9 @@ class Settings:
     # OpenAI API 설정 (Upstage AI와 호환성을 위해)
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", os.getenv("UPSTAGE_API_KEY", ""))
     
+    # Database 설정
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "")
+    
     # CORS 설정
     CORS_ORIGINS: List[str] = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
     
