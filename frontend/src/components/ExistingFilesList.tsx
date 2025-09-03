@@ -38,12 +38,9 @@ const ExistingFilesList: React.FC = () => {
 
   const handleFileSelect = (file: ExistingFile) => {
     // 파일 선택 시 채팅 페이지로 이동
-    // Mock 모드에서는 임시 document_id 생성
     const mockDocumentId = `existing_${Date.now()}`;
-    console.log('Selected file:', file.filename, 'Document ID:', mockDocumentId);
-    
-    // 채팅 페이지로 이동
-    navigate(`/chat/${mockDocumentId}`);
+    // 파일 메타데이터를 state로 전달
+    navigate(`/chat/${mockDocumentId}`, { state: { file } });
   };
 
   if (isLoading) {

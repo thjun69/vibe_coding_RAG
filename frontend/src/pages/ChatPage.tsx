@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { useMutation, useQuery } from '@tanstack/react-query';
 import { ArrowLeft, FileText, Trash2, MessageSquare } from 'lucide-react';
 import ChatMessage from '../components/ChatMessage';
@@ -10,6 +10,7 @@ import { ChatMessage as ChatMessageType, ChatResponse } from '../types';
 const ChatPage: React.FC = () => {
   const { documentId } = useParams<{ documentId: string }>();
   const navigate = useNavigate();
+  const location = useLocation() as any;
   const messagesEndRef = useRef<HTMLDivElement>(null);
   
   const [messages, setMessages] = useState<ChatMessageType[]>([]);
@@ -17,20 +18,36 @@ const ChatPage: React.FC = () => {
   const [sampleQuestions, setSampleQuestions] = useState<string[]>([]);
   const [isExistingFile, setIsExistingFile] = useState<boolean>(false);
 
-  // 기존 파일인지 확인
+  // 기존 파일인지 확인 + 메타 정보 안내 메시지 출력
   useEffect(() => {
     if (documentId && documentId.startsWith('existing_')) {
       setIsExistingFile(true);
-      // 기존 파일에 대한 환영 메시지 추가
-      const welcomeMessage: ChatMessageType = {
+
+      const file = location?.state?.file as {
+        filename: string;
+        size_mb: number;
+        modified_time: string;
+        file_path: string;
+      } | undefined;
+
+      const metaLines = file
+        ? [
+            `파일명: ${file.filename}`,
+            `크기: ${file.size_mb} MB`,
+            `수정일: ${new Date(file.modified_time).toLocaleString('ko-KR')}`,
+            `경로: ${file.file_path}`,
+          ].join('\n')
+        : '선택한 기존 PDF 파일의 메타데이터를 불러왔습니다.';
+
+      const metaMessage: ChatMessageType = {
         role: 'assistant',
-        content: '기존 PDF 파일을 선택하셨습니다. 이 파일에 대해 질문하시면 AI가 답변을 제공합니다. Mock 모드에서는 샘플 응답을 제공합니다.',
+        content: `선택한 기존 PDF의 메타 정보입니다:\n\n${metaLines}\n\n이 파일에 대해 질문하시면 AI가 답변을 제공합니다.`,
         timestamp: new Date().toISOString(),
         sources: []
       };
-      setMessages([welcomeMessage]);
+      setMessages([metaMessage]);
     }
-  }, [documentId]);
+  }, [documentId, location?.state]);
 
   // 샘플 질문 조회
   const { data: sampleQuestionsData } = useQuery({
@@ -101,13 +118,7 @@ const ChatPage: React.FC = () => {
         setSessionId(response.session_id);
       }
       
-      // 새 메시지 추가
-      const newUserMessage: ChatMessageType = {
-        role: 'user',
-        content: response.response, // 실제로는 사용자 메시지가 필요
-        timestamp: new Date().toISOString(),
-      };
-      
+      // 어시스턴트 메시지만 추가 (사용자 메시지는 handleSendMessage에서 이미 추가됨)
       const newAssistantMessage: ChatMessageType = {
         role: 'assistant',
         content: response.response,
@@ -115,7 +126,7 @@ const ChatPage: React.FC = () => {
         sources: response.sources,
       };
       
-      setMessages(prev => [...prev, newUserMessage, newAssistantMessage]);
+      setMessages(prev => [...prev, newAssistantMessage]);
     },
     onError: (error: any) => {
       console.error('Chat error:', error);

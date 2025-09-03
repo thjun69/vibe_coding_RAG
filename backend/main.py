@@ -4,16 +4,22 @@ import asyncio
 import logging
 from datetime import datetime
 from typing import Dict, Any, List
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import aiofiles
+import hashlib
 
 from config import settings
 from models import (
     UploadResponse, ProcessingStatusResponse, ChatRequest, 
     ChatResponse, ChatHistoryResponse, ErrorResponse
 )
+
+# DB 연동 추가
+from sqlalchemy.orm import Session
+from db import get_db
+from db_models import Document, DocumentStatus, IndexJob, IndexJobType, IndexJobStatus
 
 # Mock 모드 확인
 if settings.USE_MOCK_MODE:
@@ -309,6 +315,249 @@ async def delete_document(document_id: str):
     except Exception as e:
         logger.error(f"Error deleting document {document_id}: {str(e)}")
         raise HTTPException(status_code=500, detail="문서 삭제 중 오류가 발생했습니다.")
+
+# -------------------- Admin: Reconcile --------------------
+@app.post(f"{settings.API_PREFIX}/admin/reconcile")
+async def reconcile_indexes(db: Session = Depends(get_db)):
+    """업로드 폴더, DB, Chroma 상태를 비교하여 인덱싱 작업 계획을 생성합니다.
+    - 신규 파일: documents에 pending으로 upsert + index_jobs에 index 생성
+    - 변경 파일: documents를 reindexing으로 업데이트 + index_jobs에 reindex 생성
+    - 사라진 파일: documents를 deleted로 마킹 + index_jobs에 delete 생성
+    - Chroma 누락: DB는 indexed인데 해당 컬렉션이 없으면 reindex 작업 생성
+    실제 인덱싱 실행은 /admin/index/run 에서 처리합니다.
+    """
+    upload_dir = settings.UPLOAD_DIR
+    if not os.path.exists(upload_dir):
+        os.makedirs(upload_dir, exist_ok=True)
+
+    # 로컬 PDF 스캔
+    local_files: Dict[str, Dict[str, Any]] = {}
+    for name in os.listdir(upload_dir):
+        if not name.lower().endswith('.pdf'):
+            continue
+        path = os.path.join(upload_dir, name)
+        stat = os.stat(path)
+        # 체크섬 계산
+        hasher = hashlib.md5()
+        with open(path, 'rb') as f:
+            for chunk in iter(lambda: f.read(8192), b''):
+                hasher.update(chunk)
+        local_files[path] = {
+            "source_path": path,
+            "file_size": stat.st_size,
+            "mtime": datetime.fromtimestamp(stat.st_mtime),
+            "checksum": hasher.hexdigest()
+        }
+
+    # DB 조회
+    db_docs: List[Document] = db.query(Document).all()
+    db_by_path = {doc.source_path: doc for doc in db_docs}
+
+    local_paths = set(local_files.keys())
+    db_paths = set(db_by_path.keys())
+
+    to_index = []
+    to_delete = []
+    to_reindex = []
+
+    # 신규/변경 감지
+    for path, meta in local_files.items():
+        doc = db_by_path.get(path)
+        if not doc:
+            to_index.append(meta)
+        else:
+            if doc.file_size != meta["file_size"] or doc.checksum != meta["checksum"]:
+                to_reindex.append((doc, meta))
+
+    # 고아 레코드 감지(파일 삭제됨)
+    for path in db_paths - local_paths:
+        doc = db_by_path[path]
+        if doc.status != DocumentStatus.DELETED.value:
+            to_delete.append(doc)
+
+    # Chroma 컬렉션 존재 여부 검증
+    chroma_missing = []
+    try:
+        chroma_collections = set()
+        if getattr(document_processor, "chroma_client", None):
+            for c in document_processor.chroma_client.list_collections():
+                # 일부 버전은 객체, 일부는 dict를 반환할 수 있음
+                name = getattr(c, "name", None) or (c.get("name") if isinstance(c, dict) else None)
+                if name:
+                    chroma_collections.add(name)
+    except Exception as e:
+        logger.warning(f"Chroma list_collections 실패: {e}")
+        chroma_collections = set()
+
+    for doc in db_docs:
+        if doc.status == DocumentStatus.INDEXED.value:
+            expected_uuid = None
+            try:
+                expected_uuid = uuid.uuid5(uuid.NAMESPACE_URL, doc.source_path)
+            except Exception:
+                pass
+            expected_collection = doc.chroma_collection or (f"document_{expected_uuid}" if expected_uuid else None)
+            if expected_collection and expected_collection not in chroma_collections:
+                # 컬렉션이 없으므로 재인덱싱 대상으로 추가
+                to_reindex.append((doc, {
+                    "file_size": doc.file_size,
+                    "mtime": doc.mtime,
+                    "checksum": doc.checksum,
+                }))
+                chroma_missing.append(doc.source_path)
+
+    # DB 적용 및 작업 큐 생성
+    created = 0
+    updated = 0
+    enqueued = 0
+
+    for meta in to_index:
+        doc = Document(
+            source_path=meta["source_path"],
+            file_size=meta["file_size"],
+            mtime=meta["mtime"],
+            checksum=meta["checksum"],
+            status=DocumentStatus.PENDING.value,
+            chroma_collection=None,
+            version=1,
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow(),
+        )
+        db.add(doc)
+        db.flush()  # doc.id 확보
+        job = IndexJob(
+            document_id=doc.id,
+            job_type=IndexJobType.INDEX.value,
+            job_status=IndexJobStatus.QUEUED.value,
+            created_at=datetime.utcnow(),
+        )
+        db.add(job)
+        created += 1
+        enqueued += 1
+
+    for doc, meta in to_reindex:
+        doc.file_size = meta.get("file_size", doc.file_size)
+        doc.mtime = meta.get("mtime", doc.mtime)
+        doc.checksum = meta.get("checksum", doc.checksum)
+        doc.status = DocumentStatus.REINDEXING.value
+        doc.updated_at = datetime.utcnow()
+        job = IndexJob(
+            document_id=doc.id,
+            job_type=IndexJobType.REINDEX.value,
+            job_status=IndexJobStatus.QUEUED.value,
+            created_at=datetime.utcnow(),
+        )
+        db.add(job)
+        updated += 1
+        enqueued += 1
+
+    for doc in to_delete:
+        doc.status = DocumentStatus.DELETED.value
+        doc.updated_at = datetime.utcnow()
+        job = IndexJob(
+            document_id=doc.id,
+            job_type=IndexJobType.DELETE.value,
+            job_status=IndexJobStatus.QUEUED.value,
+            created_at=datetime.utcnow(),
+        )
+        db.add(job)
+        updated += 1
+        enqueued += 1
+
+    db.commit()
+
+    return {
+        "summary": {
+            "local_files": len(local_files),
+            "db_records": len(db_docs),
+            "to_index": len(to_index),
+            "to_reindex": len(to_reindex),
+            "to_delete": len(to_delete),
+            "chroma_missing": len(chroma_missing),
+            "created": created,
+            "updated": updated,
+            "enqueued": enqueued,
+        },
+        "samples": {
+            "index": [m["source_path"] for m in to_index][:5],
+            "reindex": [d.source_path for d, _ in to_reindex][:5],
+            "delete": [d.source_path for d in to_delete][:5],
+            "chroma_missing": chroma_missing[:5],
+        }
+    }
+
+# -------------------- Admin: Index Worker --------------------
+@app.post(f"{settings.API_PREFIX}/admin/index/run")
+async def run_index_worker(limit: int = Query(10, ge=1, le=100), db: Session = Depends(get_db)):
+    """큐에 쌓인 작업을 최대 limit개까지 실행합니다. (동기/단순 워커)
+    - index/reindex: 파일 경로에서 문서를 처리하고 Chroma에 반영
+    - delete: Chroma 및 파일 정리
+    처리 결과에 따라 documents.status 및 jobs 상태를 갱신합니다.
+    """
+    jobs: List[IndexJob] = (
+        db.query(IndexJob)
+        .filter(IndexJob.job_status == IndexJobStatus.QUEUED.value)
+        .order_by(IndexJob.created_at.asc())
+        .limit(limit)
+        .all()
+    )
+
+    processed = 0
+    succeeded = 0
+    failed = 0
+
+    for job in jobs:
+        doc: Document = db.query(Document).get(job.document_id)
+        if not doc:
+            job.job_status = IndexJobStatus.FAILED.value
+            job.error_message = "Document not found"
+            job.finished_at = datetime.utcnow()
+            failed += 1
+            continue
+
+        try:
+            job.job_status = IndexJobStatus.RUNNING.value
+            db.commit()
+
+            # 문서 ID는 경로 기반 고정 UUID로 생성
+            doc_uuid = uuid.uuid5(uuid.NAMESPACE_URL, doc.source_path)
+            file_path = doc.source_path
+
+            if job.job_type == IndexJobType.DELETE.value:
+                # 파일이 이미 없는 경우도 고려하여 Chroma만 정리
+                document_processor.cleanup_document(str(doc_uuid))
+                doc.status = DocumentStatus.DELETED.value
+                doc.updated_at = datetime.utcnow()
+
+            else:
+                # 파일 존재 확인
+                if not os.path.exists(file_path):
+                    raise FileNotFoundError(f"file not found: {file_path}")
+                # 인덱싱/재인덱싱 수행
+                result = await document_processor.process_pdf(file_path, str(doc_uuid))
+                doc.status = DocumentStatus.INDEXED.value
+                doc.chroma_collection = f"document_{doc_uuid}"
+                doc.version = doc.version + 1
+                doc.updated_at = datetime.utcnow()
+
+            job.job_status = IndexJobStatus.SUCCEEDED.value
+            job.finished_at = datetime.utcnow()
+            succeeded += 1
+        except Exception as e:
+            job.job_status = IndexJobStatus.FAILED.value
+            job.error_message = str(e)
+            job.finished_at = datetime.utcnow()
+            failed += 1
+        finally:
+            processed += 1
+            db.commit()
+
+    return {
+        "processed": processed,
+        "succeeded": succeeded,
+        "failed": failed,
+        "remaining": db.query(IndexJob).filter(IndexJob.job_status == IndexJobStatus.QUEUED.value).count(),
+    }
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
