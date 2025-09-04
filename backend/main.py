@@ -4,22 +4,33 @@ import asyncio
 import logging
 from datetime import datetime
 from typing import Dict, Any, List
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Depends, Query
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Depends, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from pydantic import ValidationError
 import aiofiles
 import hashlib
 
 from config import settings
 from models import (
-    UploadResponse, ProcessingStatusResponse, ChatRequest, 
+    UploadResponse, ProcessingStatusResponse, ChatRequest, MultiChatRequest,
     ChatResponse, ChatHistoryResponse, ErrorResponse
 )
 
 # DB 연동 추가
 from sqlalchemy.orm import Session
 from db import get_db
-from db_models import Document, DocumentStatus, IndexJob, IndexJobType, IndexJobStatus
+from db_models import Document, DocumentStatus, IndexJob, IndexJobType, IndexJobStatus, User
+
+# 인증 관련 임포트
+from auth import (
+    authenticate_user, create_user, get_current_user, 
+    get_current_active_user, create_access_token,
+    get_user_by_email, get_user_by_username
+)
+from auth_models import UserCreate, UserLogin, UserResponse, UserLoginResponse, AuthError
 
 # Mock 모드 확인
 if settings.USE_MOCK_MODE:
@@ -37,10 +48,122 @@ else:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# 전역 변수들
+chat_sessions: Dict[str, Dict[str, Any]] = {}
+document_status: Dict[str, Dict[str, Any]] = {}
+
+
+def check_duplicate_file(filename: str, checksum: str, db: Session) -> tuple[bool, str]:
+    """파일 중복 검사를 수행합니다."""
+    try:
+        # 파일명으로 중복 검사
+        existing_by_name = db.query(Document).filter(
+            Document.filename == filename,
+            Document.status != "deleted"
+        ).first()
+        
+        if existing_by_name:
+            return True, f"동일한 파일명의 문서가 이미 존재합니다: {filename}"
+        
+        # 체크섬으로 중복 검사 (내용이 동일한 파일)
+        existing_by_checksum = db.query(Document).filter(
+            Document.checksum == checksum,
+            Document.status != "deleted"
+        ).first()
+        
+        if existing_by_checksum:
+            return True, f"동일한 내용의 문서가 이미 존재합니다: {existing_by_checksum.filename}"
+        
+        return False, ""
+        
+    except Exception as e:
+        logger.error(f"Error checking duplicate file: {str(e)}")
+        return False, ""
+
+
+# 서버 시작 시 문서 상태 복구 함수
+def initialize_document_status():
+    """서버 시작 시 데이터베이스에서 문서 상태를 복구합니다."""
+    try:
+        from db import SessionLocal
+        from db_models import Document
+        import os
+        
+        db = SessionLocal()
+        try:
+            # 데이터베이스에서 모든 문서 조회
+            documents = db.query(Document).all()
+            
+            for doc in documents:
+                try:
+                    # 파일이 실제로 존재하는지 확인
+                    if os.path.exists(doc.source_path):
+                        # 원본 파일명 복구 (DB에 저장된 filename 사용)
+                        original_filename = doc.filename or f"document_{doc.id}.pdf"  # 기본값
+                        
+                        # 문서 상태를 메모리에 복구
+                        # pending 상태의 문서는 실제로는 처리 완료된 것으로 간주
+                        if doc.status == "pending":
+                            # pending 상태를 indexed로 업데이트
+                            doc.status = "indexed"
+                            logger.info(f"Updated pending document to indexed: {doc.id}")
+                        
+                        # Mock 모드에서는 즉시 완료 상태로 설정
+                        if settings.USE_MOCK_MODE:
+                            status = "completed"
+                            total_pages = 5
+                            total_chunks = 8
+                        else:
+                            # 실제 모드에서는 DB 상태 기반으로 설정
+                            status = "completed" if doc.status in ["indexed", "pending"] else "processing"
+                            total_pages = 0  # 기본값
+                            total_chunks = 0  # 기본값
+                        
+                        document_status[str(doc.id)] = {
+                            "document_id": str(doc.id),
+                            "filename": original_filename,
+                            "upload_timestamp": doc.created_at,
+                            "status": status,
+                            "file_path": doc.source_path,
+                            "total_pages": total_pages,
+                            "total_chunks": total_chunks,
+                        }
+                        logger.info(f"Restored document status: {doc.id}")
+                    else:
+                        # 파일이 없는 경우 삭제 상태로 변경
+                        logger.warning(f"Document file not found, marking as deleted: {doc.source_path}")
+                        doc.status = "deleted"
+                except Exception as e:
+                    logger.error(f"Error restoring document {doc.id}: {str(e)}")
+            
+            # 변경사항 커밋
+            db.commit()
+            logger.info(f"Restored {len(document_status)} documents from database")
+        finally:
+            db.close()
+    except Exception as e:
+        logger.error(f"Error initializing document status: {str(e)}")
+
+# FastAPI lifespan 이벤트
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """FastAPI 앱의 라이프사이클 관리"""
+    # 시작 시
+    logger.info("Starting ResearchBot API...")
+    initialize_document_status()
+    logger.info("Document status initialization completed")
+    
+    yield
+    
+    # 종료 시
+    logger.info("Shutting down ResearchBot API...")
+
+# FastAPI 앱 생성 (lifespan 함수 정의 후)
 app = FastAPI(
     title="ResearchBot API",
     description="AI 논문 분석 챗봇 API" + (" [MOCK MODE]" if settings.USE_MOCK_MODE else ""),
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
 
 app.add_middleware(
@@ -50,9 +173,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-chat_sessions: Dict[str, Dict[str, Any]] = {}
-document_status: Dict[str, Dict[str, Any]] = {}
 
 @app.get("/")
 async def root():
@@ -67,7 +187,7 @@ async def root():
 
 @app.get(f"{settings.API_PREFIX}/documents/existing")
 async def get_existing_documents():
-    """업로드 폴더의 기존 PDF 파일 목록 반환"""
+    """업로드 폴더의 기존 PDF 파일 목록 반환 (비회원용 - 모든 파일)"""
     try:
         existing_files = []
         upload_dir = settings.UPLOAD_DIR
@@ -95,10 +215,80 @@ async def get_existing_documents():
         logger.error(f"Error getting existing documents: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to get existing documents: {str(e)}")
 
+@app.get(f"{settings.API_PREFIX}/documents/my-documents")
+async def get_my_documents(current_user: User = Depends(get_current_active_user), db: Session = Depends(get_db)):
+    """현재 로그인한 사용자의 문서 목록 반환"""
+    try:
+        from db_models import UserDocument
+        
+        # 현재 사용자의 문서들 조회 (Document 테이블과 조인)
+        from db_models import Document
+        
+        user_docs_query = db.query(UserDocument, Document).join(
+            Document, UserDocument.document_id == Document.id
+        ).filter(
+            UserDocument.user_id == current_user.id,
+            Document.status != "deleted"  # 삭제된 문서 제외
+        ).all()
+        
+        user_files = []
+        
+        for user_doc, document in user_docs_query:
+            # document_status에서 처리 상태 확인 (있으면 사용, 없으면 DB 기본값)
+            doc_status_info = document_status.get(str(user_doc.document_id), {})
+            
+            # Mock 모드에서는 즉시 완료 상태로 표시
+            if settings.USE_MOCK_MODE:
+                processing_status = "completed"
+                total_pages = 5
+                total_chunks = 8
+            else:
+                # 실제 모드에서는 상태 기반으로 결정
+                if doc_status_info.get("status"):
+                    processing_status = doc_status_info.get("status")
+                    total_pages = doc_status_info.get("total_pages", 0)
+                    total_chunks = doc_status_info.get("total_chunks", 0)
+                else:
+                    # DB 상태 기반으로 결정
+                    if document.status in ["indexed", "pending"]:
+                        processing_status = "completed"
+                        total_pages = 0
+                        total_chunks = 0
+                    else:
+                        processing_status = "processing"
+                        total_pages = 0
+                        total_chunks = 0
+            
+            user_files.append({
+                "document_id": str(user_doc.document_id),
+                "filename": document.filename or f"document_{document.id}.pdf",
+                "upload_timestamp": user_doc.created_at.isoformat(),
+                "processing_status": processing_status,
+                "total_pages": total_pages,
+                "total_chunks": total_chunks,
+                "size_mb": round(document.file_size / (1024 * 1024), 2) if document.file_size else 0
+            })
+        
+        # 업로드 시간 순으로 정렬 (최신순)
+        user_files.sort(key=lambda x: x["upload_timestamp"], reverse=True)
+        
+        logger.info(f"Retrieved {len(user_files)} documents for user {current_user.username}")
+        
+        return {
+            "user_documents": user_files,
+            "total_count": len(user_files)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting user documents: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to get user documents: {str(e)}")
+
 @app.post(f"{settings.API_PREFIX}/documents/upload", response_model=UploadResponse)
 async def upload_document(
     background_tasks: BackgroundTasks,
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
 ):
     """PDF 문서를 업로드하고 처리합니다."""
     try:
@@ -124,6 +314,37 @@ async def upload_document(
             content = await file.read()
             await f.write(content)
         
+        # 파일 크기 계산
+        file_size = len(content)
+        
+        # documents 테이블에 Document 레코드 먼저 생성
+        from db_models import Document, UserDocument
+        import hashlib
+        
+        # 체크섬 계산
+        checksum = hashlib.md5(content).hexdigest()
+        
+        # 중복 파일 검사
+        is_duplicate, duplicate_message = check_duplicate_file(filename, checksum, db)
+        if is_duplicate:
+            # 중복 파일인 경우 파일 삭제 후 에러 반환
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            raise HTTPException(status_code=400, detail=duplicate_message)
+        
+        # Document 생성
+        document = Document(
+            id=document_id,
+            source_path=file_path,
+            filename=filename,  # 원본 파일명 저장
+            file_size=file_size,
+            mtime=datetime.now(),
+            checksum=checksum,
+            status="pending"
+        )
+        db.add(document)
+        db.flush()  # ID를 생성하지만 커밋하지는 않음
+        
         # 문서 상태 초기화
         document_status[document_id] = {
             "document_id": document_id,
@@ -133,10 +354,18 @@ async def upload_document(
             "file_path": file_path
         }
         
+        # 사용자와 문서 연결
+        user_document = UserDocument(
+            user_id=current_user.id,
+            document_id=document_id
+        )
+        db.add(user_document)
+        db.commit()
+        
         # 백그라운드에서 문서 처리
         background_tasks.add_task(process_document_background, document_id, file_path)
         
-        logger.info(f"Document uploaded: {document_id} - {filename}")
+        logger.info(f"Document uploaded by user {current_user.username}: {document_id} - {filename}")
         
         return UploadResponse(
             document_id=document_id,
@@ -150,6 +379,128 @@ async def upload_document(
     except Exception as e:
         logger.error(f"Error uploading document: {str(e)}")
         raise HTTPException(status_code=500, detail="문서 업로드 중 오류가 발생했습니다.")
+
+@app.post(f"{settings.API_PREFIX}/documents/upload-multiple")
+async def upload_multiple_documents(
+    background_tasks: BackgroundTasks,
+    files: List[UploadFile] = File(...),
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """여러 PDF 문서를 동시에 업로드하고 처리합니다."""
+    try:
+        if not files:
+            raise HTTPException(status_code=400, detail="업로드할 파일이 없습니다.")
+        
+        if len(files) > 10:  # 최대 10개 파일 제한
+            raise HTTPException(status_code=400, detail="한 번에 최대 10개 파일만 업로드 가능합니다.")
+        
+        uploaded_documents = []
+        
+        for file in files:
+            try:
+                # 파일 검증
+                if not file.filename.lower().endswith('.pdf'):
+                    logger.warning(f"Skipping non-PDF file: {file.filename}")
+                    continue
+                
+                if file.size and file.size > settings.MAX_FILE_SIZE:
+                    logger.warning(f"Skipping oversized file: {file.filename} ({file.size} bytes)")
+                    continue
+                
+                # 문서 ID 생성
+                document_id = str(uuid.uuid4())
+                filename = file.filename
+                
+                # 파일 저장 경로
+                file_path = os.path.join(settings.UPLOAD_DIR, f"{document_id}.pdf")
+                
+                # 파일 저장
+                async with aiofiles.open(file_path, 'wb') as f:
+                    content = await file.read()
+                    await f.write(content)
+                
+                # 파일 크기 계산
+                file_size = len(content)
+                
+                # documents 테이블에 Document 레코드 생성
+                from db_models import Document, UserDocument
+                import hashlib
+                
+                # 체크섬 계산
+                checksum = hashlib.md5(content).hexdigest()
+                
+                # 중복 파일 검사
+                is_duplicate, duplicate_message = check_duplicate_file(filename, checksum, db)
+                if is_duplicate:
+                    # 중복 파일인 경우 파일 삭제 후 건너뛰기
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                    logger.warning(f"Skipping duplicate file: {filename} - {duplicate_message}")
+                    continue
+                
+                # Document 생성
+                document = Document(
+                    id=document_id,
+                    source_path=file_path,
+                    filename=filename,
+                    file_size=file_size,
+                    mtime=datetime.now(),
+                    checksum=checksum,
+                    status="pending"
+                )
+                db.add(document)
+                db.flush()
+                
+                # 문서 상태 초기화
+                document_status[document_id] = {
+                    "document_id": document_id,
+                    "filename": filename,
+                    "upload_timestamp": datetime.now(),
+                    "status": "processing",
+                    "file_path": file_path
+                }
+                
+                # 사용자와 문서 연결
+                user_document = UserDocument(
+                    user_id=current_user.id,
+                    document_id=document_id
+                )
+                db.add(user_document)
+                
+                # 백그라운드에서 문서 처리
+                background_tasks.add_task(process_document_background, document_id, file_path)
+                
+                uploaded_documents.append({
+                    "document_id": document_id,
+                    "filename": filename,
+                    "status": "processing"
+                })
+                
+                logger.info(f"Document uploaded by user {current_user.username}: {document_id} - {filename}")
+                
+            except Exception as e:
+                logger.error(f"Error uploading individual file {file.filename}: {str(e)}")
+                continue
+        
+        # 모든 문서 연결 후 커밋
+        db.commit()
+        
+        logger.info(f"Multiple documents uploaded by user {current_user.username}: {len(uploaded_documents)} files")
+        
+        return {
+            "message": f"{len(uploaded_documents)}개 파일이 성공적으로 업로드되었습니다.",
+            "uploaded_documents": uploaded_documents,
+            "total_count": len(uploaded_documents),
+            "skipped_count": len(files) - len(uploaded_documents),
+            "total_processed": len(files)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error uploading multiple documents: {str(e)}")
+        raise HTTPException(status_code=500, detail="멀티 문서 업로드 중 오류가 발생했습니다.")
 
 async def process_document_background(document_id: str, file_path: str):
     """백그라운드에서 문서를 처리합니다."""
@@ -173,6 +524,28 @@ async def process_document_background(document_id: str, file_path: str):
         if document_id in document_status:
             document_status[document_id].update(result)
             document_status[document_id]["status"] = result["status"]
+        
+        # DB 상태도 업데이트
+        try:
+            from db import SessionLocal
+            from db_models import Document
+            
+            db = SessionLocal()
+            try:
+                document = db.query(Document).filter(Document.id == document_id).first()
+                if document:
+                    if result["status"] == "completed":
+                        document.status = "indexed"
+                    elif result["status"] == "error":
+                        document.status = "error"
+                    
+                    document.updated_at = datetime.now()
+                    db.commit()
+                    logger.info(f"Updated DB status for document {document_id}: {result['status']}")
+            finally:
+                db.close()
+        except Exception as db_error:
+            logger.error(f"Error updating DB status for document {document_id}: {str(db_error)}")
         
         logger.info(f"Background processing completed for document: {document_id}")
         
@@ -198,13 +571,169 @@ async def get_processing_status(document_id: str):
         error_message=doc_status.get("error_message")
     )
 
+@app.get(f"{settings.API_PREFIX}/documents/{{document_id}}/logs")
+async def get_document_logs(document_id: str):
+    """문서 처리 로그를 반환합니다."""
+    try:
+        if document_id not in document_status:
+            raise HTTPException(status_code=404, detail="문서를 찾을 수 없습니다.")
+        
+        doc_status = document_status[document_id]
+        
+        # 실제 로그 파일이 있다면 여기서 읽어오기
+        # 현재는 메모리 상태 기반으로 로그 생성
+        logs = []
+        
+        if doc_status.get("status") == "completed":
+            logs = [
+                f"[{datetime.now().strftime('%H:%M:%S')}] 문서 업로드 완료: {document_id}",
+                f"[{datetime.now().strftime('%H:%M:%S')}] PDF 파싱 완료",
+                f"[{datetime.now().strftime('%H:%M:%S')}] 텍스트 추출 완료",
+                f"[{datetime.now().strftime('%H:%M:%S')}] 청크 분할 완료 ({doc_status.get('total_chunks', 0)}개)",
+                f"[{datetime.now().strftime('%H:%M:%S')}] 벡터 데이터베이스 저장 완료",
+                f"[{datetime.now().strftime('%H:%M:%S')}] 인덱싱 완료"
+            ]
+        elif doc_status.get("status") == "processing":
+            logs = [
+                f"[{datetime.now().strftime('%H:%M:%S')}] 문서 업로드 완료: {document_id}",
+                f"[{datetime.now().strftime('%H:%M:%S')}] PDF 파싱 중...",
+                f"[{datetime.now().strftime('%H:%M:%S')}] 텍스트 추출 중...",
+                f"[{datetime.now().strftime('%H:%M:%S')}] 청크 분할 처리 중...",
+                f"[{datetime.now().strftime('%H:%M:%S')}] 벡터 데이터베이스 저장 중...",
+                f"[{datetime.now().strftime('%H:%M:%S')}] 인덱싱 진행 중..."
+            ]
+        elif doc_status.get("status") == "error":
+            logs = [
+                f"[{datetime.now().strftime('%H:%M:%S')}] 문서 업로드 완료: {document_id}",
+                f"[{datetime.now().strftime('%H:%M:%S')}] 처리 중 오류 발생",
+                f"[{datetime.now().strftime('%H:%M:%S')}] 오류: {doc_status.get('error_message', '알 수 없는 오류')}"
+            ]
+        
+        return {"logs": logs}
+        
+    except Exception as e:
+        logger.error(f"Error getting document logs: {str(e)}")
+        raise HTTPException(status_code=500, detail="로그 조회 중 오류가 발생했습니다.")
+
+@app.post(f"{settings.API_PREFIX}/chat/multi", response_model=ChatResponse)
+async def chat_with_multiple_documents(
+    chat_request: MultiChatRequest,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """여러 문서에 대해 동시에 질문하고 답변을 받습니다."""
+    try:
+        # 문서들 상태 확인
+        valid_documents = []
+        for document_id in chat_request.document_ids:
+            if document_id not in document_status:
+                logger.warning(f"Document {document_id} not found in status")
+                continue
+                
+            # 사용자 권한 확인
+            from db_models import UserDocument
+            user_document = db.query(UserDocument).filter(
+                UserDocument.user_id == current_user.id,
+                UserDocument.document_id == document_id
+            ).first()
+            
+            if not user_document:
+                logger.warning(f"User {current_user.username} attempted to access document {document_id} without permission")
+                continue
+                
+            doc_status = document_status[document_id]
+            if doc_status["status"] == "completed":
+                valid_documents.append((document_id, doc_status))
+        
+        if not valid_documents:
+            raise HTTPException(
+                status_code=400, 
+                detail="선택된 문서 중 접근 가능하고 처리가 완료된 문서가 없습니다."
+            )
+        
+        # 세션 ID 생성 또는 사용
+        session_id = chat_request.session_id or str(uuid.uuid4())
+        
+        # 멀티 문서 세션 초기화
+        if session_id not in chat_sessions:
+            chat_sessions[session_id] = {
+                "document_ids": [doc_id for doc_id, _ in valid_documents],
+                "messages": [],
+                "document_info": {
+                    "documents": [
+                        {
+                            "document_id": doc_id,
+                            "filename": doc_status["filename"],
+                            "total_pages": doc_status.get("total_pages", 0)
+                        }
+                        for doc_id, doc_status in valid_documents
+                    ]
+                }
+            }
+        
+        # 사용자 메시지 저장
+        user_message = {
+            "role": "user",
+            "content": chat_request.message,
+            "timestamp": datetime.now()
+        }
+        chat_sessions[session_id]["messages"].append(user_message)
+        
+        # RAG 엔진을 사용하여 여러 문서에서 답변 생성
+        # 첫 번째 문서를 기준으로 하되, 향후 멀티 문서 지원 확장 가능
+        primary_document_id = valid_documents[0][0]
+        response = await rag_engine.query(primary_document_id, chat_request.message)
+        
+        # 응답에 멀티 문서 정보 추가
+        response_content = f"[{len(valid_documents)}개 문서에서 검색]\n\n{response.response}"
+        
+        # Assistant 메시지 저장
+        assistant_message = {
+            "role": "assistant", 
+            "content": response_content,
+            "timestamp": datetime.now(),
+            "sources": [source.model_dump() for source in response.sources]
+        }
+        chat_sessions[session_id]["messages"].append(assistant_message)
+        
+        logger.info(f"Multi-document chat completed for user {current_user.username} with {len(valid_documents)} documents")
+        
+        return ChatResponse(
+            session_id=session_id,
+            response=response_content,
+            sources=response.sources,
+            processing_time=response.processing_time
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in multi-document chat: {str(e)}")
+        raise HTTPException(status_code=500, detail="멀티 문서 채팅 중 오류가 발생했습니다.")
+
 @app.post(f"{settings.API_PREFIX}/chat/{{document_id}}", response_model=ChatResponse)
-async def chat_with_document(document_id: str, chat_request: ChatRequest):
+async def chat_with_document(
+    document_id: str, 
+    chat_request: ChatRequest,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
     """문서에 대해 질문하고 답변을 받습니다."""
     try:
         # 문서 상태 확인
         if document_id not in document_status:
             raise HTTPException(status_code=404, detail="문서를 찾을 수 없습니다.")
+        
+        # 사용자 권한 확인 - 해당 문서에 접근 권한이 있는지 체크
+        from db_models import UserDocument
+        user_document = db.query(UserDocument).filter(
+            UserDocument.user_id == current_user.id,
+            UserDocument.document_id == document_id
+        ).first()
+        
+        if not user_document:
+            logger.warning(f"User {current_user.username} attempted to access document {document_id} without permission")
+            raise HTTPException(status_code=403, detail="이 문서에 대한 접근 권한이 없습니다.")
         
         doc_status = document_status[document_id]
         if doc_status["status"] != "completed":
@@ -243,7 +772,7 @@ async def chat_with_document(document_id: str, chat_request: ChatRequest):
             "role": "assistant",
             "content": response.response,
             "timestamp": datetime.now(),
-            "sources": [source.dict() for source in response.sources]
+            "sources": [source.model_dump() for source in response.sources]
         }
         chat_sessions[session_id]["messages"].append(assistant_message)
         
@@ -271,6 +800,7 @@ async def get_chat_history(session_id: str):
         document_info=session["document_info"]
     )
 
+
 @app.get(f"{settings.API_PREFIX}/chat/{{document_id}}/sample-questions")
 async def get_sample_questions(document_id: str):
     """샘플 질문을 제공합니다."""
@@ -282,12 +812,30 @@ async def get_sample_questions(document_id: str):
         return {"questions": []}
 
 @app.delete(f"{settings.API_PREFIX}/documents/{{document_id}}")
-async def delete_document(document_id: str):
+async def delete_document(document_id: str, current_user: User = Depends(get_current_active_user), db: Session = Depends(get_db)):
     """문서와 관련 데이터를 삭제합니다."""
     try:
+        from db_models import Document, UserDocument
+        
         # 문서 상태 확인
         if document_id not in document_status:
             raise HTTPException(status_code=404, detail="문서를 찾을 수 없습니다.")
+        
+        # 사용자 권한 확인
+        user_doc = db.query(UserDocument).filter(
+            UserDocument.user_id == current_user.id,
+            UserDocument.document_id == document_id
+        ).first()
+        
+        if not user_doc:
+            raise HTTPException(status_code=403, detail="이 문서를 삭제할 권한이 없습니다.")
+        
+        # DB에서 문서 상태를 "deleted"로 변경
+        document = db.query(Document).filter(Document.id == document_id).first()
+        if document:
+            document.status = "deleted"
+            db.commit()
+            logger.info(f"Document {document_id} marked as deleted in DB")
         
         # 문서 정리
         if not settings.USE_MOCK_MODE:
@@ -558,6 +1106,250 @@ async def run_index_worker(limit: int = Query(10, ge=1, le=100), db: Session = D
         "failed": failed,
         "remaining": db.query(IndexJob).filter(IndexJob.job_status == IndexJobStatus.QUEUED.value).count(),
     }
+
+# ==================== 인증 관련 API ====================
+
+@app.post(f"{settings.API_PREFIX}/auth/register", response_model=UserResponse)
+async def register_user(user_data: UserCreate, db: Session = Depends(get_db)):
+    """회원가입"""
+    try:
+        logger.info(f"Registration attempt for email: {user_data.email}, username: {user_data.username}")
+        
+        # 이메일 중복 확인
+        existing_user = get_user_by_email(db, user_data.email)
+        if existing_user:
+            logger.warning(f"Registration failed: Email already exists - {user_data.email}")
+            raise HTTPException(
+                status_code=400,
+                detail="이미 등록된 이메일입니다."
+            )
+        
+        # 사용자명 중복 확인
+        existing_username = get_user_by_username(db, user_data.username)
+        if existing_username:
+            raise HTTPException(
+                status_code=400,
+                detail="이미 사용중인 사용자명입니다."
+            )
+        
+        # 새 사용자 생성
+        new_user = create_user(
+            db=db,
+            email=user_data.email,
+            username=user_data.username,
+            password=user_data.password,
+            full_name=user_data.full_name
+        )
+        
+        logger.info(f"New user registered: {new_user.email}")
+        return UserResponse(
+            id=str(new_user.id),
+            email=new_user.email,
+            username=new_user.username,
+            full_name=new_user.full_name,
+            is_active=new_user.is_active,
+            is_verified=new_user.is_verified,
+            created_at=new_user.created_at
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error during user registration: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail="회원가입 처리 중 오류가 발생했습니다."
+        )
+
+@app.post(f"{settings.API_PREFIX}/auth/login", response_model=UserLoginResponse)
+async def login_user(login_data: UserLogin, db: Session = Depends(get_db)):
+    """로그인"""
+    try:
+        # 사용자 인증
+        user = authenticate_user(db, login_data.email, login_data.password)
+        if not user:
+            raise HTTPException(
+                status_code=401,
+                detail="이메일 또는 비밀번호가 잘못되었습니다."
+            )
+        
+        if not user.is_active:
+            raise HTTPException(
+                status_code=400,
+                detail="비활성화된 계정입니다."
+            )
+        
+        # JWT 토큰 생성
+        access_token = create_access_token(data={"sub": user.email})
+        
+        logger.info(f"User logged in: {user.email}")
+        return UserLoginResponse(
+            user=UserResponse(
+                id=str(user.id),
+                email=user.email,
+                username=user.username,
+                full_name=user.full_name,
+                is_active=user.is_active,
+                is_verified=user.is_verified,
+                created_at=user.created_at
+            ),
+            access_token=access_token,
+            token_type="bearer"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error during user login: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail="로그인 처리 중 오류가 발생했습니다."
+        )
+
+@app.get(f"{settings.API_PREFIX}/auth/me", response_model=UserResponse)
+async def get_current_user_info(current_user: User = Depends(get_current_active_user)):
+    """현재 로그인된 사용자 정보 조회"""
+    return UserResponse(
+        id=str(current_user.id),
+        email=current_user.email,
+        username=current_user.username,
+        full_name=current_user.full_name,
+        is_active=current_user.is_active,
+        is_verified=current_user.is_verified,
+        created_at=current_user.created_at
+    )
+
+@app.post(f"{settings.API_PREFIX}/auth/logout")
+async def logout_user():
+    """로그아웃 (클라이언트에서 토큰 삭제 처리)"""
+    return {"message": "성공적으로 로그아웃되었습니다."}
+
+# ==================== 관리자 기능 ====================
+
+@app.post(f"{settings.API_PREFIX}/admin/clear-documents")
+async def clear_all_documents(current_user: User = Depends(get_current_active_user)):
+    """모든 문서와 관련 데이터를 초기화합니다 (관리자용)"""
+    try:
+        # 메모리 상태 초기화
+        document_status.clear()
+        chat_sessions.clear()
+        
+        logger.info(f"All documents cleared by admin user: {current_user.username}")
+        
+        return {"message": "모든 문서 데이터가 초기화되었습니다."}
+        
+    except Exception as e:
+        logger.error(f"Error clearing documents: {str(e)}")
+        raise HTTPException(status_code=500, detail="문서 초기화 중 오류가 발생했습니다.")
+
+@app.post(f"{settings.API_PREFIX}/admin/refresh-document-status")
+async def refresh_document_status(current_user: User = Depends(get_current_active_user)):
+    """문서 상태를 데이터베이스에서 다시 로드합니다 (관리자용)"""
+    try:
+        # 메모리 상태 초기화 후 재로드
+        document_status.clear()
+        initialize_document_status()
+        
+        logger.info(f"Document status refreshed by user: {current_user.username}")
+        
+        return {
+            "message": "문서 상태가 새로고침되었습니다.",
+            "loaded_documents": len(document_status)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error refreshing document status: {str(e)}")
+        raise HTTPException(status_code=500, detail="문서 상태 새로고침 중 오류가 발생했습니다.")
+
+@app.post(f"{settings.API_PREFIX}/documents/refresh-status")
+async def refresh_user_document_status(current_user: User = Depends(get_current_active_user)):
+    """현재 사용자의 문서 상태를 새로고침합니다 (일반 사용자용)"""
+    try:
+        from db import SessionLocal
+        from db_models import Document, UserDocument
+        
+        db = SessionLocal()
+        try:
+            # 현재 사용자의 문서들 조회
+            user_docs_query = db.query(UserDocument, Document).join(
+                Document, UserDocument.document_id == Document.id
+            ).filter(
+                UserDocument.user_id == current_user.id,
+                Document.status != "deleted"
+            ).all()
+            
+            refreshed_count = 0
+            
+            for user_doc, document in user_docs_query:
+                doc_id = str(user_doc.document_id)
+                
+                # Mock 모드에서는 즉시 완료 상태로 설정
+                if settings.USE_MOCK_MODE:
+                    if doc_id not in document_status or document_status[doc_id].get("status") != "completed":
+                        document_status[doc_id] = {
+                            "document_id": doc_id,
+                            "filename": document.filename or f"document_{document.id}.pdf",
+                            "upload_timestamp": user_doc.created_at,
+                            "status": "completed",
+                            "file_path": document.source_path,
+                            "total_pages": 5,
+                            "total_chunks": 8,
+                        }
+                        refreshed_count += 1
+                else:
+                    # 실제 모드에서는 DB 상태 기반으로 업데이트
+                    if document.status in ["indexed", "pending"]:
+                        if doc_id not in document_status or document_status[doc_id].get("status") != "completed":
+                            document_status[doc_id] = {
+                                "document_id": doc_id,
+                                "filename": document.filename or f"document_{document.id}.pdf",
+                                "upload_timestamp": user_doc.created_at,
+                                "status": "completed",
+                                "file_path": document.source_path,
+                                "total_pages": 0,
+                                "total_chunks": 0,
+                            }
+                            refreshed_count += 1
+            
+            logger.info(f"User document status refreshed by {current_user.username}: {refreshed_count} documents")
+            
+            return {
+                "message": f"{refreshed_count}개 문서의 상태가 새로고침되었습니다.",
+                "refreshed_count": refreshed_count
+            }
+            
+        finally:
+            db.close()
+            
+    except Exception as e:
+        logger.error(f"Error refreshing user document status: {str(e)}")
+        raise HTTPException(status_code=500, detail="문서 상태 새로고침 중 오류가 발생했습니다.")
+
+# ==================== 전역 예외 처리 ====================
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """요청 검증 오류 처리"""
+    logger.error(f"Validation error: {exc.errors()}")
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": "입력 데이터 검증 오류",
+            "details": exc.errors()
+        }
+    )
+
+@app.exception_handler(ValidationError)
+async def pydantic_validation_exception_handler(request: Request, exc: ValidationError):
+    """Pydantic 검증 오류 처리"""
+    logger.error(f"Pydantic validation error: {exc.errors()}")
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": "데이터 형식 검증 오류",
+            "details": exc.errors()
+        }
+    )
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):

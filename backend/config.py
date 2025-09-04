@@ -39,6 +39,10 @@ class Settings:
     CHUNK_OVERLAP: int = 200
     MAX_CHUNKS_PER_DOCUMENT: int = 100
     
+    # 인증 설정
+    SECRET_KEY: str = os.getenv("SECRET_KEY", "your-secret-key-change-this-in-production-very-long-secret-key-for-jwt-token")
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
+    
     # Mock 모드 설정 (Upstage AI API 할당량 부족 시 true로 설정)
     @property
     def USE_MOCK_MODE(self) -> bool:

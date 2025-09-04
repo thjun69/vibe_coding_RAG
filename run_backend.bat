@@ -4,7 +4,10 @@ echo.
 
 cd backend
 
-echo Installing dependencies...
+echo Activating conda py311 environment...
+call conda activate py311
+
+echo Installing dependencies (if needed)...
 pip install -r requirements.txt
 
 echo.

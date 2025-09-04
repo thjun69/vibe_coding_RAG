@@ -47,6 +47,11 @@ class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
 
+class MultiChatRequest(BaseModel):
+    message: str
+    document_ids: List[str]
+    session_id: Optional[str] = None
+
 class Source(BaseModel):
     page_number: int
     section: str

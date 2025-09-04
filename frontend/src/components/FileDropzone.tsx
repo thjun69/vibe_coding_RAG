@@ -3,14 +3,19 @@ import { useDropzone } from 'react-dropzone';
 import { Upload, FileText, AlertCircle } from 'lucide-react';
 
 interface FileDropzoneProps {
-  onFileUpload: (file: File) => void;
+  onFileUpload: (files: File[]) => void;
   isUploading?: boolean;
+  multiple?: boolean;
 }
 
-const FileDropzone: React.FC<FileDropzoneProps> = ({ onFileUpload, isUploading = false }) => {
+const FileDropzone: React.FC<FileDropzoneProps> = ({ 
+  onFileUpload, 
+  isUploading = false, 
+  multiple = false 
+}) => {
   const onDrop = useCallback((acceptedFiles: File[]) => {
     if (acceptedFiles.length > 0) {
-      onFileUpload(acceptedFiles[0]);
+      onFileUpload(acceptedFiles);
     }
   }, [onFileUpload]);
 
@@ -19,7 +24,7 @@ const FileDropzone: React.FC<FileDropzoneProps> = ({ onFileUpload, isUploading =
     accept: {
       'application/pdf': ['.pdf']
     },
-    maxFiles: 1,
+    maxFiles: multiple ? 10 : 1,
     disabled: isUploading
   });
 
@@ -52,14 +57,18 @@ const FileDropzone: React.FC<FileDropzoneProps> = ({ onFileUpload, isUploading =
                 ? 'PDF 파일만 업로드 가능합니다' 
                 : isDragActive 
                   ? '파일을 여기에 놓으세요' 
-                  : 'PDF 논문을 업로드하세요'
+                  : multiple 
+                    ? '여러 PDF 논문을 업로드하세요'
+                    : 'PDF 논문을 업로드하세요'
               }
             </h3>
             
             <p className="text-sm text-gray-600">
               {isDragReject 
                 ? 'PDF 형식의 파일만 지원됩니다.' 
-                : '드래그 앤 드롭으로 파일을 업로드하거나 클릭하여 선택하세요'
+                : multiple
+                  ? '드래그 앤 드롭으로 여러 파일을 업로드하거나 클릭하여 선택하세요 (최대 10개)'
+                  : '드래그 앤 드롭으로 파일을 업로드하거나 클릭하여 선택하세요'
               }
             </p>
           </div>
@@ -67,7 +76,7 @@ const FileDropzone: React.FC<FileDropzoneProps> = ({ onFileUpload, isUploading =
           {!isDragActive && !isDragReject && (
             <div className="flex items-center space-x-2 text-sm text-gray-500">
               <FileText className="w-4 h-4" />
-              <span>PDF 파일 (최대 50MB)</span>
+              <span>PDF 파일 (최대 50MB) {multiple && '- 최대 10개 파일'}</span>
             </div>
           )}
           

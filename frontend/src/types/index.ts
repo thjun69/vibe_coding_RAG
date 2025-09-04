@@ -15,6 +15,18 @@ export interface UploadResponse {
   estimated_processing_time: string;
 }
 
+export interface MultipleUploadResponse {
+  message: string;
+  uploaded_documents: Array<{
+    document_id: string;
+    filename: string;
+    status: string;
+  }>;
+  total_count: number;
+  skipped_count: number;
+  total_processed: number;
+}
+
 export interface ProcessingStatusResponse {
   document_id: string;
   status: 'processing' | 'completed' | 'error';
@@ -56,4 +68,38 @@ export interface ChatHistoryResponse {
     filename: string;
     total_pages: number;
   };
+}
+
+// 사용자 인증 관련 타입들
+export interface User {
+  id: string;
+  email: string;
+  username: string;
+  full_name?: string;
+  is_active: boolean;
+  is_verified: boolean;
+  created_at: string;
+}
+
+export interface UserCreate {
+  email: string;
+  username: string;
+  password: string;
+  full_name?: string;
+}
+
+export interface UserLogin {
+  email: string;
+  password: string;
+}
+
+export interface UserLoginResponse {
+  user: User;
+  access_token: string;
+  token_type: string;
+}
+
+export interface AuthError {
+  detail: string;
+  error_type: string;
 }
